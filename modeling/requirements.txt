@@ -1,4 +1,5 @@
-transformers==4.35.0  # Future version may break the code, upgrade with caution
+# transformers==4.35.0  # Future version may break the code, upgrade with caution
+transformers
 lxml
 numpy
 datasets
