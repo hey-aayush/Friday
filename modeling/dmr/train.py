@@ -44,6 +44,7 @@ def main(cfg):
     batch_size = cfg.train.batch_size_per_device
     num_epochs = cfg.train.num_epochs
     scheduler = cfg.train.scheduler
+    demo_dir = cfg.train.demo_dir
 
     split_path = split_path = Path(cfg.data.split_path).expanduser()
     model_save_dir = Path(cfg.model.save_dir).expanduser()
@@ -57,7 +58,7 @@ def main(cfg):
 
     # Data loading
     demo_names = wl.utils.load_demo_names_in_split(split_path, split=split)
-    demos = [wl.Demonstration(demo_name) for demo_name in demo_names]
+    demos = [wl.Demonstration(demo_name, demo_dir) for demo_name in demo_names]
 
     if cfg.project_name.endswith("testing"):
         demos = demos[:10]
