@@ -11,9 +11,38 @@ from sentence_transformers.losses import CosineSimilarityLoss
 import transformers
 from weblinx.utils.hydra import save_path_to_hydra_logs
 import weblinx as wl
-
+import shutil
+import subprocess
+import json
+import os
+from huggingface_hub import snapshot_download
 from .processing import build_records_for_single_demo, build_formatters
 
+def delete_demos(demo_dir):
+  if os.path.isdir(demo_dir):
+    shutil.rmtree(demo_dir)
+
+def download_demo(demo_names,sample_data_dir):
+  patterns = [f"demonstrations/{name}/*" for name in demo_names]
+  ignore_patterns = [f"demonstrations/{name}/screenshots/*" for name in demo_names]
+  ignore_patterns += [f"demonstrations/{name}/*.mp4" for name in demo_names]
+  snapshot_download(
+      "McGill-NLP/WebLINX-full", repo_type="dataset", local_dir=sample_data_dir, allow_patterns=patterns,ignore_patterns=ignore_patterns
+  )
+
+def return_split_data(split_path):
+  with open(split_path, 'r') as file:
+    data = json.load(file)
+    return data
+
+def fetch_next_demos(split_path,train_split,buffer_split,data,start, end):
+  demo_names=data[train_split][start:end]
+  data[buffer_split] = []
+  data[buffer_split] = demo_names
+  # Save the modified JSON back to the file
+  with open(split_path, 'w') as file:
+    json.dump(data, file, indent=2)
+  return demo_names
 
 def infer_optimizer(name):
     name = name.lower()
@@ -29,34 +58,7 @@ def infer_optimizer(name):
     else:
         raise ValueError(f"Unknown optimizer name: {name}")
 
-
-@hydra.main(version_base=None, config_path="conf", config_name="config")
-def main(cfg):
-    torch.manual_seed(cfg.seed)
-
-    model_name = cfg.model.name
-    use_bf16 = cfg.model.use_bf16
-    max_seq_length = cfg.model.max_seq_length
-    optim = cfg.train.optim
-    split = cfg.train.split
-    learning_rate = cfg.train.learning_rate
-    warmup_steps = cfg.train.warmup_steps
-    batch_size = cfg.train.batch_size_per_device
-    num_epochs = cfg.train.num_epochs
-    scheduler = cfg.train.scheduler
-    demo_dir = cfg.train.demo_dir
-
-    split_path = split_path = Path(cfg.data.split_path).expanduser()
-    model_save_dir = Path(cfg.model.save_dir).expanduser()
-
-    if use_bf16:
-        torch_dtype = torch.bfloat16
-        use_amp = False
-    else:
-        torch_dtype = torch.float32
-        use_amp = True
-
-    # Data loading
+def load_new_data(split_path,split,demo_dir,cfg,batch_size):
     demo_names = wl.utils.load_demo_names_in_split(split_path, split=split)
     demos = [wl.Demonstration(demo_name, demo_dir) for demo_name in demo_names]
 
@@ -89,6 +91,67 @@ def main(cfg):
     ]
 
     train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=batch_size)
+    return train_dataloader
+
+def train_dmr(num_epochs,use_amp,torch_dtype,model,train_dataloader,train_loss,optim,warmup_steps,model_save_dir,scheduler,learning_rate):
+    logging.info(f"Starting training for {num_epochs} epochs.")
+    with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch_dtype):
+        model.fit(
+            train_objectives=[(train_dataloader, train_loss)],
+            epochs=num_epochs,
+            optimizer_class=infer_optimizer(optim),
+            warmup_steps=warmup_steps,
+            output_path=str(model_save_dir),
+            weight_decay=0.0,
+            scheduler=scheduler,
+            optimizer_params={"lr": learning_rate},
+        )
+    logging.info("Training complete.")
+
+def start_batch_dmr_training(split_path,split,cfg,batch_size,num_epochs,use_amp,torch_dtype,model,train_loss,optim,warmup_steps,model_save_dir,scheduler,learning_rate,demo_dir,sample_data_dir):
+  train_split = 'train'
+  buffer_split = 'sample_train'
+  data = return_split_data(split_path)
+  total=len(data[train_split])
+  step=60
+  for idx in range(0,total,step):
+    print(f"Clearing last demos")
+    delete_demos(demo_dir)
+    start,end = idx, min(total-1,idx+step)
+    print(f"Fetching demos {idx}-{end}")
+    demo_names = fetch_next_demos(split_path,train_split,buffer_split,data,start, end)
+    print(f"Downloading demos {idx}-{end}")
+    download_demo(demo_names,sample_data_dir)
+    print(f"Training DMR on demos {idx}-{end}")
+    train_dataloader=load_new_data(split_path,split,demo_dir,cfg,batch_size)
+    train_dmr(num_epochs,use_amp,torch_dtype,model,train_dataloader,train_loss,optim,warmup_steps,model_save_dir,scheduler,learning_rate)
+
+
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg):
+    torch.manual_seed(cfg.seed)
+
+    model_name = cfg.model.name
+    use_bf16 = cfg.model.use_bf16
+    max_seq_length = cfg.model.max_seq_length
+    optim = cfg.train.optim
+    split = cfg.train.split
+    learning_rate = cfg.train.learning_rate
+    warmup_steps = cfg.train.warmup_steps
+    batch_size = cfg.train.batch_size_per_device
+    num_epochs = cfg.train.num_epochs
+    scheduler = cfg.train.scheduler
+    demo_dir = cfg.train.demo_dir
+    sample_data_dir = cfg.train.sample_data_dir
+    split_path = split_path = Path(cfg.data.split_path).expanduser()
+    model_save_dir = Path(cfg.model.save_dir).expanduser()
+
+    if use_bf16:
+        torch_dtype = torch.bfloat16
+        use_amp = False
+    else:
+        torch_dtype = torch.float32
+        use_amp = True
 
     # Model loading
     word_embedding_model = st_models.Transformer(
@@ -111,19 +174,7 @@ def main(cfg):
         
     train_loss = CosineSimilarityLoss(model=model)
 
-    logging.info(f"Starting training for {num_epochs} epochs.")
-    with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch_dtype):
-        model.fit(
-            train_objectives=[(train_dataloader, train_loss)],
-            epochs=num_epochs,
-            optimizer_class=infer_optimizer(optim),
-            warmup_steps=warmup_steps,
-            output_path=str(model_save_dir),
-            weight_decay=0.0,
-            scheduler=scheduler,
-            optimizer_params={"lr": learning_rate},
-        )
-    logging.info("Training complete.")
+    start_batch_dmr_training(split_path,split,cfg,batch_size,num_epochs,use_amp,torch_dtype,model,train_loss,optim,warmup_steps,model_save_dir,scheduler,learning_rate,demo_dir,sample_data_dir)
 
     save_path_to_hydra_logs(save_dir=model_save_dir)
 
