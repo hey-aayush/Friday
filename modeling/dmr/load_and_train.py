@@ -103,8 +103,10 @@ def main(cfg):
         word_embedding_model.get_word_embedding_dimension()
     )
     if os.path.exists(model_save_dir):
+        logging.info(f"Creating New Model")
         model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
     else:
+        logging.info(f"Loading Trained Model")
         model = SentenceTransformer(str('/mnt/batch/tasks/shared/LS_root/mounts/clusters/ashandilya-fhl-weblinx/code/Users/ashandilya_debug/FINAL/weblinx/checkpoints/dmr/sentence-transformers/all-MiniLM-L6-v2'))
         
     train_loss = CosineSimilarityLoss(model=model)
